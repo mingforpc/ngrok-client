@@ -94,6 +94,7 @@ func (conn *ProxyConnection) connectLocal(isSSL bool, port uint) error {
 
 	if err != nil {
 		// TODO: 错误处理 
+		fmt.Println("connectLocal():" + err.Error())
 	} else {
 		conn.localConn = connection
 	}
@@ -118,6 +119,7 @@ func (conn *ProxyConnection) Start() {
 
 	if err != nil {
 		// 错误处理
+		fmt.Println("Start():" + err.Error())
 	}
 
 	conn.removeWriteChan <- content
@@ -140,6 +142,7 @@ func (conn *ProxyConnection) writeLocal() {
 
 			if err != nil {
 				// TODO: 错误处理
+				fmt.Println("writeLocal():" + err.Error())
 			}
 
 			buf = buf[n:]
@@ -163,6 +166,7 @@ func (conn *ProxyConnection) writeRemote() {
 
 			if err != nil {
 				// TODO: 错误处理
+				fmt.Println("writeRemote():" + err.Error())
 			}
 
 			buf = buf[n:]
@@ -174,13 +178,14 @@ func (conn *ProxyConnection) writeRemote() {
 // readLocal() 从本地服务读取数据
 func (conn *ProxyConnection) readLocal() {
 
-	buf := make([]byte, config.READ_BUF_SIZE)
+	buf := make([]byte, config.CONFIG.ReadBufSize)
 
 	for conn.isClose == false {
 		n, err := conn.localConn.Read(buf)
 		fmt.Printf("readLocal: %s", buf[0:n])
 		if err != nil {
 			// TODO: 错误处理
+			fmt.Println("readLocal():" + err.Error())
 		} else {
 			conn.removeWriteChan <- buf[0: n]
 		}
@@ -200,7 +205,7 @@ func (conn *ProxyConnection) readRemote() {
 
 	for conn.isClose == false {
 
-		buf := make([]byte, config.READ_BUF_SIZE)
+		buf := make([]byte, config.CONFIG.ReadBufSize)
 		
 		if !conn.isStart {
 			// 还未接收 StartProxy 命令	
@@ -209,6 +214,7 @@ func (conn *ProxyConnection) readRemote() {
 
 			if err != nil {
 				// TODO: 错误处理
+				fmt.Println("readRemote():" + err.Error())
 			}
 
 			if n <= 0 {
@@ -302,6 +308,7 @@ func (conn *ProxyConnection) readRemote() {
 			
 			if err != nil {
 				// TODO: 错误处理
+				fmt.Println("readRemote():" + err.Error())
 			}
 
 			if dataBuffer == nil {
@@ -361,10 +368,12 @@ func (conn *ProxyConnection) startProxyHandler(resp util.StartProxy) int {
 		
 		if err == nil {
 			conn.isStart = true
-		}
 
-		go conn.writeLocal()
-		go conn.readLocal()
+			go conn.writeLocal()
+			go conn.readLocal()
+		} else {
+			fmt.Println("startProxyHandler():" + err.Error())
+		}
 
 	} else if resp.Url == conn.controlConn.HTTPSUrl {
 		// 代理HTTPS
@@ -372,14 +381,32 @@ func (conn *ProxyConnection) startProxyHandler(resp util.StartProxy) int {
 
 		if err == nil {
 			conn.isStart = true
-		}
 
-		go conn.writeLocal()
-		go conn.readLocal()
+			go conn.writeLocal()
+			go conn.readLocal()
+		} else {
+			fmt.Println("startProxyHandler():" + err.Error())
+		}
 
 	} else {
 		errnum = errcode.ERR_UNKNOW_PROXY_URL
 	}
 
 	return errnum
+}
+
+func (conn *ProxyConnection) Close() {
+
+	if !conn.isClose {
+		
+		if conn.localConn != nil {
+			conn.localConn.Close() 
+		}
+		
+		if conn.proxyConn != nil {
+			conn.proxyConn.Close()
+		}
+		
+		conn.isClose = true
+	}
 }

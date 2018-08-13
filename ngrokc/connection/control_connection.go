@@ -141,6 +141,9 @@ func (conn *ControlConnection) write() {
 
 			if err != nil {
 				// TODO: 错误处理
+				fmt.Println("write():" + err.Error())
+
+				conn.Close()
 			}
 
 			buf = buf[n:]
@@ -157,17 +160,21 @@ func (conn *ControlConnection) readHandler() {
 	var cmdLen uint16 = 0
 
 	for conn.isClose == false {
-
-		buf := make([]byte, config.READ_BUF_SIZE)
+		fmt.Println(config.CONFIG.ReadBufSize)
+		buf := make([]byte, config.CONFIG.ReadBufSize)
 
 		n, err := conn.conn.Read(buf)
 
 		if err != nil {
 			// TODO: 错误处理
+			fmt.Println("readHandler():" + err.Error())
+
+			conn.Close()
 		}
 
 		if n <= 0 {
 			// TODO: 错误处理
+			conn.Close()
 		}
 
 		if n > 8 && tempBuffer == nil {
@@ -304,6 +311,7 @@ func (conn *ControlConnection) authRespHandler(resp util.AuthResp) int {
 
 		if err != nil {
 			// TODO: 错误处理
+			fmt.Println("authRespHandler():" + err.Error())
 		}
 
 		// 将请求放入发送缓存队列
@@ -320,6 +328,7 @@ func (conn *ControlConnection) authRespHandler(resp util.AuthResp) int {
 
 		if err != nil {
 			// TODO: 错误处理
+			fmt.Println("authRespHandler():" + err.Error())
 		}
 
 		// 将请求放入发送缓存队列
@@ -363,14 +372,19 @@ func (conn *ControlConnection) reqProxyHandler(resp util.ReqProxy) int {
 	return errcode.ERR_SUCCESS
 }
 
-// // startProxyHandler()处理StartProxy的响应函数
-// func (conn *ControlConnection) startProxyHandler(resp util.StartProxy) int {
-
-// 	return errcode.ERR_SUCCESS
-// }
-
 // pongHandler()处理Pong的响应函数
 func (conn *ControlConnection) pongHandler(resp util.Pong) int {
 
 	return errcode.ERR_SUCCESS
+}
+
+// Close() 关闭连接
+func (conn *ControlConnection) Close() {
+
+	if !conn.isClose {
+		err := conn.conn.Close()
+		conn.isClose = true
+		fmt.Println("Close():" + err.Error())
+	}
+	
 }
