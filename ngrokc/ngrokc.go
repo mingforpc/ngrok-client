@@ -1,15 +1,17 @@
 package ngrokc
 
 import (
-	"syscall"
 	"fmt"
-	"os"
-	"os/signal"
 	"ngrok-client/ngrokc/config"
 	"ngrok-client/ngrokc/connection"
+	"os"
+	"os/signal"
+	"syscall"
 )
 
 func Start() {
+
+	defer exceptionPrecess()
 
 	config.ParseConfig()
 
@@ -23,15 +25,26 @@ func Start() {
 	ccon.Init(config.CONFIG.ServerHostname, config.CONFIG.ServerPort, config.CONFIG.User, config.CONFIG.Password)
 	ccon.SetHTTPConfig(config.CONFIG.HttpHostname, config.CONFIG.HttpSubdomain, config.CONFIG.HttpAuth, config.CONFIG.HttpLocalPort)
 	ccon.SetHTTPSConfig(config.CONFIG.HttpsHostname, config.CONFIG.HttpsSubdomain, config.CONFIG.HttpsAuth, config.CONFIG.HttpsLocalPort)
-	ccon.Service()
+	err := ccon.Service()
+
+	fmt.Println(err)
 
 }
 
 func exit(signalChan chan os.Signal, ccon *connection.ControlConnection) {
 
-	sign := <- signalChan
+	sign := <-signalChan
 
 	fmt.Println(sign)
 
 	ccon.Close()
+}
+
+func exceptionPrecess() {
+	p := recover()
+	switch p {
+	case nil:
+	default:
+		panic(p)
+	}
 }
