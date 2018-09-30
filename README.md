@@ -1,9 +1,18 @@
 # ngrok-client
 ngrok 的 客户端
 
-Demo 版本，缺少错误处理，代理连接池管理等
+Demo 版本
 
 需要实现的：
 
-1. 错误处理 + 正确关闭通道
-2. 连接池的实现
+1. 添加守护进程模式的设置
+2. goroutine池的实现 
+
+使用方法:
+
+```
+go build ngrok-client/
+
+获取命令行帮助：
+./ngrok-client --help 
+```
