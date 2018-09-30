@@ -164,6 +164,8 @@ func (conn *ProxyConnection) writeLocal() {
 
 					buf = buf[n:]
 				}
+			} else {
+				return
 			}
 		}
 
@@ -200,6 +202,8 @@ func (conn *ProxyConnection) writeRemote() {
 
 					buf = buf[n:]
 				}
+			} else {
+				return
 			}
 
 		}

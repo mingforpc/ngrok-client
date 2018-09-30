@@ -1,38 +1,36 @@
 package connection
 
-import(
-
-	"fmt"
-	"errors"
-	"net"
-	"strconv"
+import (
 	"bytes"
 	"crypto/tls"
+	"fmt"
+	"net"
+	"ngrok-client/ngrokc/config"
 	errcode "ngrok-client/ngrokc/err"
 	"ngrok-client/ngrokc/util"
-	"ngrok-client/ngrokc/config"
+	"strconv"
 )
 
 type ControlConnection struct {
 	ServerDomain string // 域名或者IP
-	ServerPort uint
-	User string
-	Password string
-	Arch string
-	ClientId string
+	ServerPort   uint
+	User         string
+	Password     string
+	Arch         string
+	ClientId     string
 
 	// 分配的HTTP信息
-	HTTPHostname string
+	HTTPHostname  string
 	HTTPSubdomain string
-	HTTPAuth string
+	HTTPAuth      string
 	HTTPLocalPort uint
 	// 服务器返回的HTTP URL
 	HTTPUrl string
 
 	// 分配的HTTPS信息
-	HTTPSHostname string
+	HTTPSHostname  string
 	HTTPSSubdomain string
-	HTTPSAuth string
+	HTTPSAuth      string
 	HTTPSLocalPort uint
 	// 服务器返回的HTTPS URL
 	HTTPSUrl string
@@ -44,7 +42,9 @@ type ControlConnection struct {
 	initialized bool
 
 	// 标记是否关闭链接, true:关闭， false:不关闭
-	isClose bool
+	IsClose bool
+	// 连接中其他goroutine的关闭信号
+	closed chan bool
 
 	// 控制的tcp连接
 	conn net.Conn
@@ -52,6 +52,7 @@ type ControlConnection struct {
 	// 写缓冲通道
 	writeChan chan []byte
 }
+
 // Init(domain string, port uint, user, password string) 初始化控制链接参数
 func (conn *ControlConnection) Init(domain string, port uint, user, password string) {
 	conn.ServerDomain = domain
@@ -62,9 +63,6 @@ func (conn *ControlConnection) Init(domain string, port uint, user, password str
 	conn.ExitWithDisconnect = false
 
 	conn.initialized = true
-
-	// 初始化写数据的缓冲通道
-	conn.writeChan = make(chan []byte, 10)
 }
 
 // SetHTTPConfig() 设置HTTP代理的配置
@@ -86,19 +84,22 @@ func (conn *ControlConnection) SetHTTPSConfig(hostname, subdomain, auth string, 
 // Service() 开始连接，如果失败返回error，该函数阻塞
 func (conn *ControlConnection) Service() error {
 	if !conn.initialized {
-		return errors.New("Should Init first!")
+		panic("Should Init first!")
 	}
-	
+
 	err := conn.connect()
 
 	if err != nil {
 		return err
 	}
 
+	// 初始化写数据的缓冲通道
+	conn.writeChan = make(chan []byte, 10)
+
 	// 为发送数据建立单独的goroutine， 通过writeChan缓冲通道交给write函数发送数据
 	go conn.write()
-	
-	auth := util.Auth{Version:"1.0.0", MmVersion:"1", User:conn.User, Password:conn.Password, OS:"!", Arch:"1", ClientId:""}
+
+	auth := util.Auth{Version: "1.0.0", MmVersion: "1", User: conn.User, Password: conn.Password, OS: "!", Arch: "1", ClientId: ""}
 
 	content, err := util.PayloadStructToBytes(auth, util.AUTH_TYPE)
 
@@ -113,7 +114,7 @@ func (conn *ControlConnection) Service() error {
 func (connection *ControlConnection) connect() error {
 
 	address := connection.ServerDomain + ":" + strconv.FormatUint(uint64(connection.ServerPort), 10)
-	
+
 	// 无视ssl证书，仅用于测试
 	config := &tls.Config{InsecureSkipVerify: true}
 
@@ -130,23 +131,33 @@ func (connection *ControlConnection) connect() error {
 // 目前设计为执行在一个单独的goroutine中
 func (conn *ControlConnection) write() {
 
-	for conn.isClose == false {
-		buf := <- conn.writeChan
+	for conn.IsClose == false {
 
-		var n = 0
-
-		for n < len(buf) {
-
-			n, err := conn.conn.Write(buf)
-
-			if err != nil {
-				// TODO: 错误处理
-				fmt.Println("write():" + err.Error())
-
-				conn.Close()
+		select {
+		case _, ok := <-conn.closed:
+			if !ok {
+				return
 			}
+		case buf, ok := <-conn.writeChan:
+			if ok {
+				var n = 0
 
-			buf = buf[n:]
+				for n < len(buf) {
+
+					n, err := conn.conn.Write(buf)
+
+					if err != nil {
+						// TODO: 错误处理
+						fmt.Println("write():" + err.Error())
+
+						conn.Close()
+					}
+
+					buf = buf[n:]
+				}
+			} else {
+				return
+			}
 		}
 	}
 
@@ -159,7 +170,7 @@ func (conn *ControlConnection) readHandler() {
 	var tempBuffer *bytes.Buffer = nil
 	var cmdLen uint16 = 0
 
-	for conn.isClose == false {
+	for conn.IsClose == false {
 		fmt.Println(config.CONFIG.ReadBufSize)
 		buf := make([]byte, config.CONFIG.ReadBufSize)
 
@@ -184,18 +195,18 @@ func (conn *ControlConnection) readHandler() {
 			// 获取到命令的长度
 			cmdLen = util.ToLen(cmdLenBytes)
 
-			if uint16(n - 8) == cmdLen {
+			if uint16(n-8) == cmdLen {
 				// 接收到的数据长度刚好等于命令长度
 				cmdBuffer = &bytes.Buffer{}
 				cmdBuffer.Write(buf[8:n])
 
-			} else if uint16(n - 8) > cmdLen {
+			} else if uint16(n-8) > cmdLen {
 				// 接收到的数据长度大于命令长度，说明完整的命令后接着有其他命令
 				cmdBuffer = &bytes.Buffer{}
-				cmdBuffer.Write(buf[8:cmdLen+8])
+				cmdBuffer.Write(buf[8 : cmdLen+8])
 
 				tempBuffer = &bytes.Buffer{}
-				tempBuffer.Write(buf[cmdLen+8:n])
+				tempBuffer.Write(buf[cmdLen+8 : n])
 
 			} else {
 				// 接收到的数据长度少于命令长度，说明该命令不完整，还需要继续获取
@@ -221,20 +232,20 @@ func (conn *ControlConnection) readHandler() {
 			// 缓存中数据的长度
 			bufLen := tempBuffer.Len()
 
-			if uint16(bufLen - 8) == cmdLen {
+			if uint16(bufLen-8) == cmdLen {
 				// 接收到的数据长度刚好等于命令长度
 				cmdBuffer = &bytes.Buffer{}
 				cmdBuffer.Write(tempBytes[8:bufLen])
 
 				tempBuffer = nil
 
-			} else if uint16(n - 8) > cmdLen {
+			} else if uint16(n-8) > cmdLen {
 				// 接收到的数据长度大于命令长度，说明完整的命令后接着有其他命令
 				cmdBuffer = &bytes.Buffer{}
-				cmdBuffer.Write(tempBytes[8:cmdLen+8])
+				cmdBuffer.Write(tempBytes[8 : cmdLen+8])
 
 				tempBuffer.Reset()
-				tempBuffer.Write(tempBytes[cmdLen+8:bufLen])
+				tempBuffer.Write(tempBytes[cmdLen+8 : bufLen])
 
 			}
 
@@ -243,9 +254,11 @@ func (conn *ControlConnection) readHandler() {
 		} else {
 			// 长度少于8byte,且不是未接收完的数据，需要错误处理
 
-			// TODO: 错误处理
+			fmt.Println("readHandler(): buf less than 8 byte and not uncompleted data!")
+			// 命令出错，关闭连接
+			conn.Close()
 		}
-		
+
 		if cmdBuffer != nil {
 			// 接收到一条完整的命令
 
@@ -264,7 +277,12 @@ func (conn *ControlConnection) dispatch(cmdBytes []byte) {
 
 	if errno != errcode.ERR_SUCCESS {
 		// 命令解析错误
-		// TODO: 错误处理
+		fmt.Printf("dispatch() ParsePayloadStruct errno: %d, err msg: %s", errno, errcode.GetErrMsg(errno))
+
+		// TODO: 命令出错，是否该断开连接？
+		// 目前先断开 control 连接处理
+		conn.Close()
+		return
 	}
 
 	var handlerErr int
@@ -287,12 +305,14 @@ func (conn *ControlConnection) dispatch(cmdBytes []byte) {
 
 	if handlerErr != errcode.ERR_SUCCESS {
 		// 错误处理
+
+		conn.Close()
 	}
 }
 
 // authRespHandler()处理AuthResp的响应函数
 func (conn *ControlConnection) authRespHandler(resp util.AuthResp) int {
-	
+
 	// TODO: 以后更新时，可能要判断服务器版本，现在先忽略Version和MmVersion
 
 	if resp.Error != "" || resp.ClientId == "" {
@@ -305,13 +325,14 @@ func (conn *ControlConnection) authRespHandler(resp util.AuthResp) int {
 	// HTTP 的 ReqTunnel 请求
 	if conn.HTTPLocalPort > 0 {
 		// 需要代理的http连接本地端口，当大于0时表示需要代理连接
-		reqTunnel := util.ReqTunnel{ReqId:"", Protocol:util.PROTOCOL_HTTP, Hostname:conn.HTTPHostname, Subdomain:conn.HTTPSubdomain, HttpAuth:"", RemotePort:0}
-		
+		reqTunnel := util.ReqTunnel{ReqId: "", Protocol: util.PROTOCOL_HTTP, Hostname: conn.HTTPHostname, Subdomain: conn.HTTPSubdomain, HttpAuth: "", RemotePort: 0}
+
 		byteData, err := util.PayloadStructToBytes(reqTunnel, util.REQ_TUNNEL_TYPE)
 
 		if err != nil {
 			// TODO: 错误处理
 			fmt.Println("authRespHandler():" + err.Error())
+			return errcode.ERR_PAYLOAD_TO_BYTES
 		}
 
 		// 将请求放入发送缓存队列
@@ -322,13 +343,14 @@ func (conn *ControlConnection) authRespHandler(resp util.AuthResp) int {
 	if conn.HTTPSLocalPort > 0 {
 		// 需要代理的https连接本地端口，当大于0时表示需要代理连接
 
-		reqTunnel := util.ReqTunnel{ReqId:"", Protocol:util.PROTOCOL_HTTPS, Hostname:conn.HTTPSHostname, Subdomain:conn.HTTPSSubdomain, HttpAuth:"", RemotePort:0}
-		
+		reqTunnel := util.ReqTunnel{ReqId: "", Protocol: util.PROTOCOL_HTTPS, Hostname: conn.HTTPSHostname, Subdomain: conn.HTTPSSubdomain, HttpAuth: "", RemotePort: 0}
+
 		byteData, err := util.PayloadStructToBytes(reqTunnel, util.REQ_TUNNEL_TYPE)
 
 		if err != nil {
 			// TODO: 错误处理
 			fmt.Println("authRespHandler():" + err.Error())
+			return errcode.ERR_PAYLOAD_TO_BYTES
 		}
 
 		// 将请求放入发送缓存队列
@@ -343,7 +365,7 @@ func (conn *ControlConnection) newTunnelHandler(resp util.NewTunnel) int {
 
 	if resp.Error != "" {
 		// 返回信息中Error不为"""
-
+		fmt.Println("resp.Error:" + resp.Error)
 		return errcode.ERR_NEW_TUNNEL_ERROR
 	}
 
@@ -361,7 +383,6 @@ func (conn *ControlConnection) newTunnelHandler(resp util.NewTunnel) int {
 // reqProxyHandller()处理ReqProxy的响应函数
 func (conn *ControlConnection) reqProxyHandler(resp util.ReqProxy) int {
 
-	fmt.Println("ReqProxy come !")
 	address := conn.ServerDomain + ":" + strconv.FormatUint(uint64(conn.ServerPort), 10)
 
 	proxyConn := ProxyConnection{}
@@ -381,10 +402,18 @@ func (conn *ControlConnection) pongHandler(resp util.Pong) int {
 // Close() 关闭连接
 func (conn *ControlConnection) Close() {
 
-	if !conn.isClose {
+	if !conn.IsClose {
+
+		// 关闭closed通道，使得其他goroutine能够知道要关闭连接
+		close(conn.closed)
+
+		conn.IsClose = true
+
 		err := conn.conn.Close()
-		conn.isClose = true
+
 		fmt.Println("Close():" + err.Error())
+
+		close(conn.writeChan)
 	}
-	
+
 }
