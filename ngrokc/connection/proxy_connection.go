@@ -9,6 +9,7 @@ import (
 	errcode "ngrok-client/ngrokc/err"
 	"ngrok-client/ngrokc/util"
 	"strconv"
+	"sync"
 )
 
 type ProxyConnection struct {
@@ -21,9 +22,11 @@ type ProxyConnection struct {
 	RemoteAddress string
 
 	// 标记是否关闭链接, true:关闭， false:不关闭
-	IsClose bool
+	isClose bool
 	// 链接中其他goroutine的关闭信号
 	closed chan bool
+	// 设置读取IsClose标识的读写锁
+	closeRWMutex sync.RWMutex
 
 	// proxy 连向服务端的连接
 	proxyConn net.Conn
@@ -42,6 +45,9 @@ type ProxyConnection struct {
 
 	// 指向控制链接的指针
 	controlConn *ControlConnection
+
+	// 释放信号量的方法
+	releaseSem *func()
 }
 
 // Init(clientId, remoteAddress string, controlConn *ControlConnection) 初始化连接，只是初始化参数，并没有真正连接，
@@ -53,6 +59,11 @@ func (conn *ProxyConnection) Init(clientId, remoteAddress string, controlConn *C
 	conn.controlConn = controlConn
 
 	conn.closed = make(chan bool)
+}
+
+// 设置是信号量的函数，设置后，将在Close()时调用
+func (conn *ProxyConnection) SetReleaseSem(releaseSem *func()) {
+	conn.releaseSem = releaseSem
 }
 
 // connectServ() 连接服务端
@@ -139,7 +150,7 @@ func (conn *ProxyConnection) Start() {
 // 目前设计为执行在一个单独的goroutine中
 func (conn *ProxyConnection) writeLocal() {
 
-	for conn.IsClose == false {
+	for conn.IsClose() == false {
 
 		select {
 		case _, ok := <-conn.closed:
@@ -148,7 +159,7 @@ func (conn *ProxyConnection) writeLocal() {
 			}
 		case buf, ok := <-conn.localWriteChan:
 			if ok {
-				fmt.Printf("writeLocal: %s", buf)
+
 				var n = 0
 
 				for n < len(buf) {
@@ -177,7 +188,7 @@ func (conn *ProxyConnection) writeLocal() {
 // 目前设计为执行在一个单独的goroutine中
 func (conn *ProxyConnection) writeRemote() {
 
-	for conn.IsClose == false {
+	for conn.IsClose() == false {
 
 		select {
 		case _, ok := <-conn.closed:
@@ -186,7 +197,6 @@ func (conn *ProxyConnection) writeRemote() {
 			}
 		case buf, ok := <-conn.remoteWriteChan:
 			if ok {
-				fmt.Printf("writeRemote: %s", buf)
 				var n = 0
 
 				for n < len(buf) {
@@ -217,10 +227,9 @@ func (conn *ProxyConnection) readLocal() {
 
 	buf := make([]byte, config.CONFIG.ReadBufSize)
 
-	for conn.IsClose == false {
+	for conn.IsClose() == false {
 
 		n, err := conn.localConn.Read(buf)
-		fmt.Printf("readLocal: %s", buf[0:n])
 		if err != nil {
 			// TODO: 错误处理
 			fmt.Println("readLocal():" + err.Error())
@@ -251,7 +260,7 @@ func (conn *ProxyConnection) readRemote() {
 
 	var cmdLen uint16 = 0
 
-	for conn.IsClose == false {
+	for conn.IsClose() == false {
 
 		buf := make([]byte, config.CONFIG.ReadBufSize)
 
@@ -349,13 +358,13 @@ func (conn *ProxyConnection) readRemote() {
 				if cmdBuffer != nil {
 					// 接收到一条完整的命令
 
-					fmt.Println(cmdBuffer.String())
+					// fmt.Println(cmdBuffer.String())
 					conn.dispatch(cmdBuffer.Bytes())
 					cmdBuffer = nil
 				}
 
 				if dataBuffer != nil {
-					fmt.Println(dataBuffer.String())
+					// fmt.Println(dataBuffer.String())
 					conn.localWriteChan <- dataBuffer.Bytes()
 					dataBuffer = nil
 
@@ -465,10 +474,14 @@ func (conn *ProxyConnection) startProxyHandler(resp util.StartProxy) int {
 // Close()关闭代理连接的方法
 func (conn *ProxyConnection) Close() {
 
-	if !conn.IsClose {
+	if !conn.IsClose() {
 
 		// 关闭closed通道，使得其他goroutine能够知道要关闭连接
 		close(conn.closed)
+
+		conn.closeRWMutex.Lock()
+		conn.isClose = true
+		conn.closeRWMutex.Unlock()
 
 		if conn.localConn != nil {
 			conn.localConn.Close()
@@ -478,9 +491,23 @@ func (conn *ProxyConnection) Close() {
 			conn.proxyConn.Close()
 		}
 
-		conn.IsClose = true
+		if conn.releaseSem != nil {
+			// 如果有释放信号量的函数，就调用
+			(*conn.releaseSem)()
+		}
 
 		close(conn.localWriteChan)
 		close(conn.remoteWriteChan)
 	}
+}
+
+// 获取是否已经连接关闭
+func (conn *ProxyConnection) IsClose() bool {
+	tempVal := false
+
+	conn.closeRWMutex.RLock()
+	tempVal = conn.isClose
+	conn.closeRWMutex.RUnlock()
+
+	return tempVal
 }

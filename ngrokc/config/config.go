@@ -17,6 +17,8 @@ type Configuration struct {
 	HttpsLocalPort uint   `json:"https_local_port"`
 
 	ReadBufSize uint `json:"read_buf_size"`
+
+	MaxProxyCount int64 `json:"max_proxy_count"`
 }
 
 var CONFIG *Configuration = &Configuration{}

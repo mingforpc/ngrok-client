@@ -1,11 +1,11 @@
 package config
 
 import (
-	"os"
-	"fmt"
-	"flag"
 	"encoding/json"
-	)
+	"flag"
+	"fmt"
+	"os"
+)
 
 var configFile = flag.String("config", "", "config file path")
 
@@ -25,12 +25,15 @@ var httpsHostname = flag.String("https_hostname", "", "Https hostname, IP or dom
 var httpsSubdomain = flag.String("https_subdomain", "", "Https subdomian name, some server maybe not accept, can be null")
 var httpsLocalPort = flag.Int("https_local_port", 0, "Local https port")
 
-var readBufSize = flag.Int("read_buf_size", 0, "")
+var readBufSize = flag.Int("read_buf_size", 0, "Socket read buffer size")
+
+// 最大Proxy连接数限制
+var maxProxyCount = flag.Int64("max_proxy_count", 10, "Proxy connection max count")
 
 // parseConfigFile() 从指定的配置文件中读取配置.
 func ParseConfigFile(filepath string, conf *Configuration) {
 	file, err := os.Open(filepath)
-	
+
 	if err != nil {
 		fmt.Println("config file error:" + err.Error())
 		return
@@ -102,6 +105,10 @@ func ParseConfig() {
 
 	if *readBufSize > 0 {
 		CONFIG.ReadBufSize = uint(*readBufSize)
+	}
+
+	if CONFIG.MaxProxyCount <= 0 {
+		CONFIG.MaxProxyCount = *maxProxyCount
 	}
 
 }

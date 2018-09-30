@@ -9,6 +9,7 @@ import (
 	errcode "ngrok-client/ngrokc/err"
 	"ngrok-client/ngrokc/util"
 	"strconv"
+	"sync"
 )
 
 type ControlConnection struct {
@@ -38,13 +39,18 @@ type ControlConnection struct {
 	// 是否在断开控制连接后，退出
 	ExitWithDisconnect bool
 
+	// 信号量，控制最大proxy连接数
+	semaphore util.Semaphore
+
 	// 是否已经初始化
 	initialized bool
 
 	// 标记是否关闭链接, true:关闭， false:不关闭
-	IsClose bool
+	isClose bool
 	// 连接中其他goroutine的关闭信号
 	closed chan bool
+	// 设置读取IsClose标识的读写锁
+	closeRWMutex sync.RWMutex
 
 	// 控制的tcp连接
 	conn net.Conn
@@ -63,6 +69,10 @@ func (conn *ControlConnection) Init(domain string, port uint, user, password str
 	conn.ExitWithDisconnect = false
 
 	conn.initialized = true
+
+	// 初始化信号量的大小
+	conn.semaphore.Init(config.CONFIG.MaxProxyCount)
+
 }
 
 // SetHTTPConfig() 设置HTTP代理的配置
@@ -131,7 +141,7 @@ func (connection *ControlConnection) connect() error {
 // 目前设计为执行在一个单独的goroutine中
 func (conn *ControlConnection) write() {
 
-	for conn.IsClose == false {
+	for conn.IsClose() == false {
 
 		select {
 		case _, ok := <-conn.closed:
@@ -170,8 +180,8 @@ func (conn *ControlConnection) readHandler() {
 	var tempBuffer *bytes.Buffer = nil
 	var cmdLen uint16 = 0
 
-	for conn.IsClose == false {
-		fmt.Println(config.CONFIG.ReadBufSize)
+	for conn.IsClose() == false {
+
 		buf := make([]byte, config.CONFIG.ReadBufSize)
 
 		n, err := conn.conn.Read(buf)
@@ -262,7 +272,7 @@ func (conn *ControlConnection) readHandler() {
 		if cmdBuffer != nil {
 			// 接收到一条完整的命令
 
-			fmt.Println(cmdBuffer.String())
+			// fmt.Println(cmdBuffer.String())
 			conn.dispatch(cmdBuffer.Bytes())
 			cmdBuffer = nil
 		}
@@ -388,6 +398,15 @@ func (conn *ControlConnection) reqProxyHandler(resp util.ReqProxy) int {
 	proxyConn := ProxyConnection{}
 	proxyConn.Init(conn.ClientId, address, conn)
 
+	// 给Proxy Connection设置一个释放信号量的方法
+	releaseSem := func() {
+		conn.semaphore.Release()
+	}
+	proxyConn.SetReleaseSem(&releaseSem)
+
+	// 通过信号量，限制proxy的最大连接数
+	conn.semaphore.Acquire()
+
 	go proxyConn.Start()
 
 	return errcode.ERR_SUCCESS
@@ -402,18 +421,34 @@ func (conn *ControlConnection) pongHandler(resp util.Pong) int {
 // Close() 关闭连接
 func (conn *ControlConnection) Close() {
 
-	if !conn.IsClose {
+	if !conn.IsClose() {
 
 		// 关闭closed通道，使得其他goroutine能够知道要关闭连接
 		close(conn.closed)
 
-		conn.IsClose = true
+		conn.closeRWMutex.Lock()
+		conn.isClose = true
+		conn.closeRWMutex.Unlock()
 
 		err := conn.conn.Close()
 
 		fmt.Println("Close():" + err.Error())
 
 		close(conn.writeChan)
+
+		// 清理信号量
+		conn.semaphore.Close()
 	}
 
+}
+
+// 获取是否已经连接关闭
+func (conn *ControlConnection) IsClose() bool {
+	tempVal := false
+
+	conn.closeRWMutex.RLock()
+	tempVal = conn.isClose
+	conn.closeRWMutex.RUnlock()
+
+	return tempVal
 }
