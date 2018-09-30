@@ -1,22 +1,20 @@
 package connection
 
 import (
-	"crypto/tls"
-	"net"
 	"bytes"
-	"strconv"
+	"crypto/tls"
 	"fmt"
-
-	"ngrok-client/ngrokc/util"
+	"net"
 	"ngrok-client/ngrokc/config"
 	errcode "ngrok-client/ngrokc/err"
+	"ngrok-client/ngrokc/util"
+	"strconv"
 )
 
 type ProxyConnection struct {
-
 	ClientId string
 
-	Url string 
+	Url        string
 	ClientAddr string
 
 	// 远程地址(ip:端口号 / 域名:端口号)
@@ -24,8 +22,10 @@ type ProxyConnection struct {
 
 	// 标记是否关闭链接, true:关闭， false:不关闭
 	IsClose bool
+	// 链接中其他goroutine的关闭信号
+	closed chan bool
 
-	// proxy 连向服务端的连接 
+	// proxy 连向服务端的连接
 	proxyConn net.Conn
 
 	// local 连向本地的连接
@@ -35,7 +35,7 @@ type ProxyConnection struct {
 	localWriteChan chan []byte
 
 	// 服务端写缓冲通道
-	removeWriteChan chan []byte
+	remoteWriteChan chan []byte
 
 	// 标记是否关闭链接, true:关闭， false:不关闭
 	isClose bool
@@ -47,14 +47,15 @@ type ProxyConnection struct {
 	controlConn *ControlConnection
 }
 
+// Init(clientId, remoteAddress string, controlConn *ControlConnection) 初始化连接，只是初始化参数，并没有真正连接，
+// 需要在Start()之前调用
 func (conn *ProxyConnection) Init(clientId, remoteAddress string, controlConn *ControlConnection) {
 	conn.ClientId = clientId
 	conn.RemoteAddress = remoteAddress
 
-	conn.removeWriteChan = make(chan []byte, 10)
-	conn.localWriteChan = make(chan []byte, 10)
-
 	conn.controlConn = controlConn
+
+	conn.closed = make(chan bool)
 }
 
 // connectServ() 连接服务端
@@ -85,7 +86,6 @@ func (conn *ProxyConnection) connectLocal(isSSL bool, port uint) error {
 		// 无视ssl证书，仅用于测试
 		config := &tls.Config{InsecureSkipVerify: true}
 
-		
 		connection, err = tls.Dial("tcp", address, config)
 	} else {
 		// 普通连接
@@ -93,7 +93,7 @@ func (conn *ProxyConnection) connectLocal(isSSL bool, port uint) error {
 	}
 
 	if err != nil {
-		// TODO: 错误处理 
+		// TODO: 错误处理
 		fmt.Println("connectLocal():" + err.Error())
 	} else {
 		conn.localConn = connection
@@ -105,9 +105,19 @@ func (conn *ProxyConnection) connectLocal(isSSL bool, port uint) error {
 // Start() 开始服务
 func (conn *ProxyConnection) Start() {
 
-	conn.connectServ()
+	// 连接服务器失败
+	err := conn.connectServ()
 
-	// 为发送给服务器数据建立单独的goroutine, 通过 removeWriteChan 缓冲通道交给writeRemote()函数发送数据
+	if err != nil {
+		fmt.Printf("Failed to connect to server: %s", err)
+		conn.Close()
+		return
+	}
+
+	conn.remoteWriteChan = make(chan []byte, 10)
+	conn.localWriteChan = make(chan []byte, 10)
+
+	// 为发送给服务器数据建立单独的goroutine, 通过 remoteWriteChan 缓冲通道交给writeRemote()函数发送数据
 	go conn.writeRemote()
 
 	go conn.readRemote()
@@ -118,12 +128,13 @@ func (conn *ProxyConnection) Start() {
 	content, err := util.PayloadStructToBytes(regProxy, util.REG_PROXY_TYPE)
 
 	if err != nil {
-		// 错误处理
-		fmt.Println("Start():" + err.Error())
+		// 组装Payload错误
+		fmt.Printf("PayloadStructToBytes() Failed in Start(): %s", err)
+		conn.Close()
+		return
 	}
 
-	conn.removeWriteChan <- content
-	
+	conn.remoteWriteChan <- content
 
 }
 
@@ -132,21 +143,33 @@ func (conn *ProxyConnection) Start() {
 func (conn *ProxyConnection) writeLocal() {
 
 	for conn.IsClose == false {
-		buf := <- conn.localWriteChan
-		fmt.Printf("writeLocal: %s", buf)
-		var n = 0
 
-		for n < len(buf) {
-
-			n, err := conn.localConn.Write(buf)
-
-			if err != nil {
-				// TODO: 错误处理
-				fmt.Println("writeLocal():" + err.Error())
+		select {
+		case _, ok := <-conn.closed:
+			if !ok {
+				return
 			}
+		case buf, ok := <-conn.localWriteChan:
+			if ok {
+				fmt.Printf("writeLocal: %s", buf)
+				var n = 0
 
-			buf = buf[n:]
+				for n < len(buf) {
+
+					n, err := conn.localConn.Write(buf)
+
+					if err != nil {
+						// TODO: 错误处理
+						fmt.Println("writeLocal():" + err.Error())
+						conn.Close()
+						return
+					}
+
+					buf = buf[n:]
+				}
+			}
 		}
+
 	}
 
 }
@@ -156,21 +179,34 @@ func (conn *ProxyConnection) writeLocal() {
 func (conn *ProxyConnection) writeRemote() {
 
 	for conn.IsClose == false {
-		buf := <- conn.removeWriteChan
-		fmt.Printf("writeRemote: %s", buf)
-		var n = 0
 
-		for n < len(buf) {
+		select {
+		case _, ok := <-conn.closed:
+			if !ok {
+				return
+			}
+		case buf, ok := <-conn.remoteWriteChan:
+			if ok {
+				fmt.Printf("writeRemote: %s", buf)
+				var n = 0
 
-			n, err := conn.proxyConn.Write(buf)
+				for n < len(buf) {
 
-			if err != nil {
-				// TODO: 错误处理
-				fmt.Println("writeRemote():" + err.Error())
+					n, err := conn.proxyConn.Write(buf)
+
+					if err != nil {
+						// TODO: 错误处理
+						fmt.Println("writeRemote():" + err.Error())
+						conn.Close()
+						return
+					}
+
+					buf = buf[n:]
+				}
 			}
 
-			buf = buf[n:]
 		}
+
 	}
 
 }
@@ -181,20 +217,31 @@ func (conn *ProxyConnection) readLocal() {
 	buf := make([]byte, config.CONFIG.ReadBufSize)
 
 	for conn.isClose == false {
+
 		n, err := conn.localConn.Read(buf)
 		fmt.Printf("readLocal: %s", buf[0:n])
 		if err != nil {
 			// TODO: 错误处理
 			fmt.Println("readLocal():" + err.Error())
-		} else {
-			conn.removeWriteChan <- buf[0: n]
+			conn.Close()
+			return
 		}
+
+		select {
+		case _, ok := <-conn.closed:
+			if !ok {
+				return
+			}
+		case conn.remoteWriteChan <- buf[0:n]:
+			continue
+		}
+
 	}
 }
 
 // readRemote() 从服务端读取数据
 func (conn *ProxyConnection) readRemote() {
-	
+
 	var cmdBuffer *bytes.Buffer = nil
 	var tempBuffer *bytes.Buffer = nil
 
@@ -206,127 +253,134 @@ func (conn *ProxyConnection) readRemote() {
 	for conn.isClose == false {
 
 		buf := make([]byte, config.CONFIG.ReadBufSize)
-		
-		if !conn.isStart {
-			// 还未接收 StartProxy 命令	
+
+		select {
+		case _, ok := <-conn.closed:
+			if !ok {
+				return
+			}
+		default:
 
 			n, err := conn.proxyConn.Read(buf)
 
 			if err != nil {
 				// TODO: 错误处理
+				conn.Close()
 				fmt.Println("readRemote():" + err.Error())
+				return
 			}
 
 			if n <= 0 {
 				// TODO: 错误处理
+				conn.Close()
+				fmt.Println("conn.proxyConn.Read() get 0 bytes:" + err.Error())
+				return
 			}
 
-			if n > 8 && tempBuffer == nil {
-				// 新的命令
+			if !conn.isStart {
+				// 还未接收 StartProxy 命令
 
-				cmdLenBytes := buf[:8]
-				// 获取到命令的长度
-				cmdLen = util.ToLen(cmdLenBytes)
+				if n > 8 && tempBuffer == nil {
+					// 新的命令
 
-				if uint16(n - 8) == cmdLen {
-					// 接收到的数据长度刚好等于命令长度
-					cmdBuffer = &bytes.Buffer{}
-					cmdBuffer.Write(buf[8:n])
-	
-				} else if uint16(n - 8) > cmdLen {
-					// 接收到的数据长度大于命令长度，说明完整的命令后接着可能是代理的数据了
-					cmdBuffer = &bytes.Buffer{}
-					cmdBuffer.Write(buf[8:cmdLen+8])
-	
-					dataBuffer = &bytes.Buffer{}
-					dataBuffer.Write(buf[cmdLen+8:n])
-	
-				} else {
-					// 接收到的数据长度少于命令长度，说明该命令不完整，还需要继续获取
-					tempBuffer = &bytes.Buffer{}
+					cmdLenBytes := buf[:8]
+					// 获取到命令的长度
+					cmdLen = util.ToLen(cmdLenBytes)
+
+					if uint16(n-8) == cmdLen {
+						// 接收到的数据长度刚好等于命令长度
+						cmdBuffer = &bytes.Buffer{}
+						cmdBuffer.Write(buf[8:n])
+
+					} else if uint16(n-8) > cmdLen {
+						// 接收到的数据长度大于命令长度，说明完整的命令后接着可能是代理的数据了
+						cmdBuffer = &bytes.Buffer{}
+						cmdBuffer.Write(buf[8 : cmdLen+8])
+
+						dataBuffer = &bytes.Buffer{}
+						dataBuffer.Write(buf[cmdLen+8 : n])
+
+					} else {
+						// 接收到的数据长度少于命令长度，说明该命令不完整，还需要继续获取
+						tempBuffer = &bytes.Buffer{}
+						tempBuffer.Write(buf[:n])
+					}
+
+				} else if tempBuffer != nil {
+					// 未接收完的命令
+
+					// 先将所有数据写入临时缓存
 					tempBuffer.Write(buf[:n])
+
+					tempBytes := tempBuffer.Bytes()
+
+					cmdLenBytes := tempBytes[:8]
+					// 获取到命令的长度
+					cmdLen = util.ToLen(cmdLenBytes)
+
+					// 缓存中数据的长度
+					bufLen := tempBuffer.Len()
+
+					if uint16(bufLen-8) == cmdLen {
+						// 接收到的数据长度刚好等于命令长度
+						cmdBuffer = &bytes.Buffer{}
+						cmdBuffer.Write(tempBytes[8:bufLen])
+
+						tempBuffer = nil
+
+					} else if uint16(n-8) > cmdLen {
+						// 接收到的数据长度大于命令长度，说明完整的命令后接着有其他命令
+						cmdBuffer = &bytes.Buffer{}
+						cmdBuffer.Write(tempBytes[8 : cmdLen+8])
+
+						dataBuffer = &bytes.Buffer{}
+						dataBuffer.Write(tempBytes[cmdLen+8 : bufLen])
+
+					}
+
+					cmdLen = 0
+
+				} else {
+					// 长度少于8byte,且不是未接收完的数据，需要错误处理
+					conn.Close()
 				}
 
-			} else if tempBuffer != nil {
-				// 未接收完的命令
+				if cmdBuffer != nil {
+					// 接收到一条完整的命令
 
-				// 先将所有数据写入临时缓存
-			tempBuffer.Write(buf[:n])
+					fmt.Println(cmdBuffer.String())
+					conn.dispatch(cmdBuffer.Bytes())
+					cmdBuffer = nil
+				}
 
-			tempBytes := tempBuffer.Bytes()
-
-			cmdLenBytes := tempBytes[:8]
-			// 获取到命令的长度
-			cmdLen = util.ToLen(cmdLenBytes)
-
-			// 缓存中数据的长度
-			bufLen := tempBuffer.Len()
-
-			if uint16(bufLen - 8) == cmdLen {
-				// 接收到的数据长度刚好等于命令长度
-				cmdBuffer = &bytes.Buffer{}
-				cmdBuffer.Write(tempBytes[8:bufLen])
-
-				tempBuffer = nil
-
-			} else if uint16(n - 8) > cmdLen {
-				// 接收到的数据长度大于命令长度，说明完整的命令后接着有其他命令
-				cmdBuffer = &bytes.Buffer{}
-				cmdBuffer.Write(tempBytes[8:cmdLen+8])
-
-				dataBuffer = &bytes.Buffer{}
-				dataBuffer.Write(tempBytes[cmdLen+8:bufLen])
-
-			}
-
-			cmdLen = 0
-
-			} else {
-				// 长度少于8byte,且不是未接收完的数据，需要错误处理
-
-				// TODO: 错误处理
-			}
-
-			if cmdBuffer != nil {
-				// 接收到一条完整的命令
-	
-				fmt.Println(cmdBuffer.String())
-				conn.dispatch(cmdBuffer.Bytes())
-				cmdBuffer = nil
-			}
-
-			if dataBuffer != nil {
-				fmt.Println(dataBuffer.String())
-				conn.localWriteChan <- dataBuffer.Bytes()
-				dataBuffer = nil
-
-			}
-
-		} else {
-			// 已经接收 StartProxy 命令
-			n, err := conn.proxyConn.Read(buf)
-			
-			if err != nil {
-				// TODO: 错误处理
-				fmt.Println("readRemote():" + err.Error())
-			}
-
-			if dataBuffer == nil {
-				dataBuffer = &bytes.Buffer{}
-			} else {
-
-				if dataBuffer.Len() > 0  {
-					
+				if dataBuffer != nil {
+					fmt.Println(dataBuffer.String())
 					conn.localWriteChan <- dataBuffer.Bytes()
+					dataBuffer = nil
+
 				}
 
-				dataBuffer.Reset()
-			}
-			
-			dataBuffer.Write(buf[0:n])
+			} else {
+				// 已经接收 StartProxy 命令
 
-			// 读写数据，传入本地连接
-			conn.localWriteChan <- dataBuffer.Bytes()
+				if dataBuffer == nil {
+					dataBuffer = &bytes.Buffer{}
+				} else {
+
+					if dataBuffer.Len() > 0 {
+
+						conn.localWriteChan <- dataBuffer.Bytes()
+					}
+
+					dataBuffer.Reset()
+				}
+
+				dataBuffer.Write(buf[0:n])
+
+				// 读写数据，传入本地连接
+				conn.localWriteChan <- dataBuffer.Bytes()
+			}
+
 		}
 
 	}
@@ -338,7 +392,12 @@ func (conn *ProxyConnection) dispatch(cmdBytes []byte) {
 
 	if errno != errcode.ERR_SUCCESS {
 		// 命令解析错误
-		// TODO: 错误处理
+
+		fmt.Printf("util.ParsePayloadStruct() err: %s", errcode.GetErrMsg(errno))
+
+		// 关闭连接
+		conn.Close()
+		return
 	}
 
 	var handlerErr int
@@ -352,27 +411,32 @@ func (conn *ProxyConnection) dispatch(cmdBytes []byte) {
 	}
 
 	if handlerErr != errcode.ERR_SUCCESS {
-		// TODO:错误处理
+		// 错误处理
+		// 关闭连接
+		conn.Close()
 	}
 }
 
 // startProxyHandler() 处理 StartProxy 请求
 func (conn *ProxyConnection) startProxyHandler(resp util.StartProxy) int {
 
-	var errnum = errcode.ERR_SUCCESS 
+	var errnum = errcode.ERR_SUCCESS
 
 	if resp.Url == conn.controlConn.HTTPUrl {
 		// 代理HTTP
 
 		err := conn.connectLocal(false, conn.controlConn.HTTPLocalPort)
-		
+
 		if err == nil {
 			conn.isStart = true
 
 			go conn.writeLocal()
 			go conn.readLocal()
 		} else {
-			fmt.Println("startProxyHandler():" + err.Error())
+			// 连接本地端口失败
+			fmt.Println("startProxyHandler() failed to connect local HTTP service:" + err.Error())
+			conn.Close()
+			errnum = errcode.ERR_CONNECT_LOCAL_FAILED
 		}
 
 	} else if resp.Url == conn.controlConn.HTTPSUrl {
@@ -385,7 +449,9 @@ func (conn *ProxyConnection) startProxyHandler(resp util.StartProxy) int {
 			go conn.writeLocal()
 			go conn.readLocal()
 		} else {
-			fmt.Println("startProxyHandler():" + err.Error())
+			fmt.Println("startProxyHandler()failed to connect local HTTPS service:" + err.Error())
+			conn.Close()
+			errnum = errcode.ERR_CONNECT_LOCAL_FAILED
 		}
 
 	} else {
@@ -395,18 +461,25 @@ func (conn *ProxyConnection) startProxyHandler(resp util.StartProxy) int {
 	return errnum
 }
 
+// Close()关闭代理连接的方法
 func (conn *ProxyConnection) Close() {
 
 	if !conn.isClose {
-		
+
+		// 关闭closed通道，使得其他goroutine能够知道要关闭连接
+		close(conn.closed)
+
 		if conn.localConn != nil {
-			conn.localConn.Close() 
+			conn.localConn.Close()
 		}
-		
+
 		if conn.proxyConn != nil {
 			conn.proxyConn.Close()
 		}
-		
+
 		conn.isClose = true
+
+		close(conn.localWriteChan)
+		close(conn.remoteWriteChan)
 	}
 }
