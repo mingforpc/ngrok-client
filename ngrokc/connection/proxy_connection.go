@@ -37,9 +37,6 @@ type ProxyConnection struct {
 	// 服务端写缓冲通道
 	remoteWriteChan chan []byte
 
-	// 标记是否关闭链接, true:关闭， false:不关闭
-	isClose bool
-
 	// 是否已经接收到 StartProxy 正式开始代理
 	isStart bool
 
@@ -216,7 +213,7 @@ func (conn *ProxyConnection) readLocal() {
 
 	buf := make([]byte, config.CONFIG.ReadBufSize)
 
-	for conn.isClose == false {
+	for conn.IsClose == false {
 
 		n, err := conn.localConn.Read(buf)
 		fmt.Printf("readLocal: %s", buf[0:n])
@@ -250,7 +247,7 @@ func (conn *ProxyConnection) readRemote() {
 
 	var cmdLen uint16 = 0
 
-	for conn.isClose == false {
+	for conn.IsClose == false {
 
 		buf := make([]byte, config.CONFIG.ReadBufSize)
 
@@ -464,7 +461,7 @@ func (conn *ProxyConnection) startProxyHandler(resp util.StartProxy) int {
 // Close()关闭代理连接的方法
 func (conn *ProxyConnection) Close() {
 
-	if !conn.isClose {
+	if !conn.IsClose {
 
 		// 关闭closed通道，使得其他goroutine能够知道要关闭连接
 		close(conn.closed)
@@ -477,7 +474,7 @@ func (conn *ProxyConnection) Close() {
 			conn.proxyConn.Close()
 		}
 
-		conn.isClose = true
+		conn.IsClose = true
 
 		close(conn.localWriteChan)
 		close(conn.remoteWriteChan)
